@@ -10,6 +10,22 @@ type AppOptions = {
   geminiProvider?: (ticket: TicketRequest) => Promise<unknown>;
 };
 
+const refundApprovalClaimPattern =
+  /\b(?:refund|reimbursement|money back)\b.{0,40}\b(?:approve(?:d|s|al)?|process(?:ed|ing)?|initiated|issued|sent|credited|on its way)\b|\b(?:approved|processed|initiated|issued|sent|credited)\b.{0,40}\b(?:refund|reimbursement|money back)\b/i;
+const unsupportedActionClaimPattern =
+  /\b(?:account|subscription)\b.{0,35}\b(?:has been|was|is)\s+(?:cancelled|canceled)\b|\b(?:cancelled|canceled)\b.{0,35}\b(?:account|subscription)\b|\b(?:issue|problem|bug|error)\b.{0,35}\b(?:is|was|has been)\s+(?:fixed|resolved)\b|\b(?:fixed|resolved)\b.{0,35}\b(?:issue|problem|bug|error)\b/i;
+const neutralRefundDraft = "A support agent will review your request and share an update.";
+
+function protectUnapprovedRefundDraft(draft: string, refundStatus: string): string {
+  if (
+    (refundStatus !== "approved" && refundApprovalClaimPattern.test(draft)) ||
+    unsupportedActionClaimPattern.test(draft)
+  ) {
+    return neutralRefundDraft;
+  }
+  return draft;
+}
+
 function sendFixtureResponse(ticket: TicketRequest, response: express.Response): void {
   const fixtureResult = triageResponseSchema.safeParse(createFixtureTriage(ticket));
   if (!fixtureResult.success) {
@@ -66,9 +82,12 @@ export function createApp(options: AppOptions = {}) {
         const responseResult = triageResponseSchema.safeParse({
           ticket_id: ticket.id,
           ...suggestion.data,
+          reply_draft: protectUnapprovedRefundDraft(suggestion.data.reply_draft, policy.refund.status),
           refund: policy.refund,
           needs_human:
-            policy.needs_human ||
+            policy.refund.status === "pending_review" ||
+            policy.category === "fraud" ||
+            policy.severity === "high" ||
             suggestion.data.category === "fraud" ||
             suggestion.data.severity === "critical" ||
             suggestion.data.confidence < 0.7,
@@ -106,6 +125,18 @@ export function createApp(options: AppOptions = {}) {
   });
 
   const handleJsonErrors: ErrorRequestHandler = (error, _request, response, _next) => {
+    if (
+      error instanceof Error &&
+      "type" in error &&
+      error.type === "entity.too.large" &&
+      "status" in error &&
+      error.status === 413
+    ) {
+      response.status(413).json({
+        error: { code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds the allowed size." },
+      });
+      return;
+    }
     if (error instanceof SyntaxError && "status" in error && error.status === 400) {
       response.status(400).json({
         error: { code: "VALIDATION_ERROR", message: "Request body must be valid JSON." },

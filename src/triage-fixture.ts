@@ -9,22 +9,28 @@ export function createFixtureTriage(ticket: TicketRequest): TriageResponse {
     /\breverse (?:this )?(?:charge|transaction)\b/.test(text);
   const disputedOrUnauthorizedCharge =
     /\b(disputed|unauthorized|unrecognized|unrecognised)[\s-]+(?:credit card )?charges?\b/.test(text) ||
-    /\bcharges?\s+(?:were )?(?:disputed|unauthorized|unrecognized|unrecognised)\b/.test(text);
+    /\bcharges?\s+(?:were )?(?:disputed|unauthorized|unrecognized|unrecognised)\b/.test(text) ||
+    /\b(?:i\s+)?(?:did not|didn't|do not|don't|never)\s+(?:authorize|authorise|recognize|recognise)\b.{0,40}\b(?:charge|payment|transaction)\b/.test(text) ||
+    /\b(?:charge|payment|transaction)\b.{0,40}\b(?:i\s+)?(?:do not|don't|did not|didn't)\s+(?:recognize|recognise|authorize|authorise)\b/.test(text);
   const renewalDispute =
     /\brenewal\b.{0,40}\b(dispute|charged|charge|refund)\b/.test(text) ||
     /\b(dispute|charged|charge|refund)\b.{0,40}\brenewal\b/.test(text);
   const stoppedAutopayButCharged = /\bstop(?:ped)? autopay\b.{0,50}\bcharged\b/.test(text);
   const hinglishPaymentActivation = /\b(paisa kat gaya|paise kat gaye|plan activate nahi hua)\b/.test(text);
+  const successfulPaymentWithoutPlanActivation =
+    /\b(?:renewal\s+)?(?:debit|payment|charge) went through\b.{0,60}\b(?:plan|subscription) did not (?:continue|activate|renew)\b/.test(text);
   const ambiguousBilling =
     /\b(payment failed|charged twice|duplicate charge|paid but|money deducted|incorrect charge|charge dispute)\b/.test(text) ||
     disputedOrUnauthorizedCharge ||
     renewalDispute ||
     stoppedAutopayButCharged ||
     hinglishPaymentActivation ||
+    successfulPaymentWithoutPlanActivation ||
     ticket.purchases.some((purchase) => purchase.status === "initiated" || purchase.status === "failed");
   const refundPending = refundRequested || ambiguousBilling;
   const severe = /\b(urgent|critical|unable to access|completely broken|fraud|stolen)\b/.test(text);
   const severity = category === "fraud" || severe ? "high" : category === "feature_request" || category === "product_question" ? "low" : "medium";
+  const confidence = 0.5;
 
   return {
     ticket_id: ticket.id,
@@ -40,8 +46,8 @@ export function createFixtureTriage(ticket: TicketRequest): TriageResponse {
     reply_draft: refundPending
       ? "This is a deterministic demo draft. A support agent should review the billing details before deciding on any refund."
       : "This is a deterministic demo draft. Thanks for contacting Dhaba; a support agent can help with your request.",
-    needs_human: refundPending || category === "fraud" || severity === "high",
-    confidence: 0.5,
+    needs_human: refundPending || category === "fraud" || severity === "high" || confidence < 0.7,
+    confidence,
   };
 }
 

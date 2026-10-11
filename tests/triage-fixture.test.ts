@@ -35,6 +35,8 @@ describe("deterministic triage fixture rules", () => {
       "I did not make this disputed charge",
       "I see an unauthorized charge",
       "Please investigate this unauthorized-charge",
+      "I did not authorize a charge",
+      "I don't recognize this payment",
     ]) {
       const result = classify(subject);
       expect(result.needs_human).toBe(true);
@@ -54,6 +56,22 @@ describe("deterministic triage fixture rules", () => {
   ])("sends renewal and refund disputes to review: %s", (subject) => {
     const result = classify(subject);
     expect(result.refund).toMatchObject({ status: "pending_review", amount_inr: 0 });
+    expect(result.needs_human).toBe(true);
+  });
+
+  it.each([
+    "My renewal debit went through but my plan did not continue",
+    "Payment went through but my plan did not activate",
+  ])("sends successful payment and plan activation mismatches to review: %s", (subject) => {
+    const result = classify(subject);
+    expect(result.refund).toMatchObject({ status: "pending_review", amount_inr: 0 });
+    expect(result.needs_human).toBe(true);
+  });
+
+  it("does not send an unrelated feature request to billing review", () => {
+    const result = classify("Please add a plan pause feature", "A renewal debit summary would be useful.");
+    expect(result.category).toBe("feature_request");
+    expect(result.refund).toMatchObject({ status: "not_applicable", amount_inr: 0 });
     expect(result.needs_human).toBe(true);
   });
 

@@ -24,8 +24,11 @@ const validTicket = {
 describe("triage API", () => {
   let server: Server;
   let baseUrl: string;
+  let previousMode: string | undefined;
 
   beforeEach(async () => {
+    previousMode = process.env.TRIAGE_MODE;
+    process.env.TRIAGE_MODE = "fixture";
     server = app.listen(0);
     await new Promise<void>((resolve) => server.once("listening", resolve));
     const address = server.address() as AddressInfo;
@@ -34,6 +37,8 @@ describe("triage API", () => {
 
   afterEach(async () => {
     await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    if (previousMode === undefined) delete process.env.TRIAGE_MODE;
+    else process.env.TRIAGE_MODE = previousMode;
   });
 
   it("returns a minimal health response", async () => {
@@ -53,6 +58,25 @@ describe("triage API", () => {
     expect(triageResponseSchema.safeParse(payload).success).toBe(true);
   });
 
+  it("escalates a benign low-confidence fixture response for human review", async () => {
+    const ticket = {
+      ...validTicket,
+      subject: "A question about my account",
+      body: "Could you explain how to use the app?",
+    };
+    const response = await fetch(`${baseUrl}/triage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(ticket),
+    });
+    const payload = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(payload.confidence).toBe(0.5);
+    expect(payload.needs_human).toBe(true);
+    expect(payload.refund).toMatchObject({ status: "not_applicable", amount_inr: 0 });
+  });
+
   it("returns a consistent HTTP 400 JSON error for an invalid ticket", async () => {
     const response = await fetch(`${baseUrl}/triage`, {
       method: "POST",
@@ -62,6 +86,31 @@ describe("triage API", () => {
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual({
       error: { code: "VALIDATION_ERROR", message: "Request body does not match the ticket schema." },
+    });
+  });
+
+  it("returns HTTP 400 for malformed JSON", async () => {
+    const response = await fetch(`${baseUrl}/triage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"id":',
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      error: { code: "VALIDATION_ERROR", message: "Request body must be valid JSON." },
+    });
+  });
+
+  it("returns a generic HTTP 413 for oversized JSON without exposing details", async () => {
+    const oversizedTicket = { ...validTicket, body: "x".repeat(110 * 1024) };
+    const response = await fetch(`${baseUrl}/triage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(oversizedTicket),
+    });
+    expect(response.status).toBe(413);
+    expect(await response.json()).toEqual({
+      error: { code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds the allowed size." },
     });
   });
 
