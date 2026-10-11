@@ -1,6 +1,7 @@
 import "dotenv/config";
+import { createHash } from "node:crypto";
 import express, { type ErrorRequestHandler } from "express";
-import { ticketRequestSchema, triageResponseSchema, type TicketRequest } from "./schemas/triage-schema.js";
+import { ticketRequestSchema, triageResponseSchema, type TicketRequest, type TriageResponse } from "./schemas/triage-schema.js";
 import { createFixtureTriage } from "./triage-fixture.js";
 import { createGeminiSuggestion, triageSuggestionSchema } from "./gemini-provider.js";
 
@@ -9,6 +10,38 @@ type AppOptions = {
   apiKey?: () => string | undefined;
   geminiProvider?: (ticket: TicketRequest) => Promise<unknown>;
 };
+
+type IdempotencyEntry = {
+  fingerprint: string;
+  response: Promise<TriageResponse | null>;
+  completed: boolean;
+};
+
+// Process-local cache bound: evict the least-recently-used completed result when full.
+const maxIdempotencyEntries = 10_000;
+
+function fingerprintTicket(ticket: TicketRequest): string {
+  const canonicalTicket = {
+    id: ticket.id,
+    received_at: ticket.received_at,
+    subject: ticket.subject,
+    body: ticket.body,
+    purchases: ticket.purchases.map((purchase) => ({
+      id: purchase.id,
+      type: purchase.type,
+      amount_inr: purchase.amount_inr,
+      status: purchase.status,
+      at: purchase.at,
+    })),
+    app_opens_since_renewal: ticket.app_opens_since_renewal,
+  };
+  return createHash("sha256").update(JSON.stringify(canonicalTicket)).digest("hex");
+}
+
+function createValidatedFixtureResponse(ticket: TicketRequest): TriageResponse | null {
+  const result = triageResponseSchema.safeParse(createFixtureTriage(ticket));
+  return result.success ? result.data : null;
+}
 
 const refundApprovalClaimPattern =
   /\b(?:refund|reimbursement|money back)\b.{0,40}\b(?:approve(?:d|s|al)?|process(?:ed|ing)?|initiated|issued|sent|credited|on its way)\b|\b(?:approved|processed|initiated|issued|sent|credited)\b.{0,40}\b(?:refund|reimbursement|money back)\b/i;
@@ -26,19 +59,9 @@ function protectUnapprovedRefundDraft(draft: string, refundStatus: string): stri
   return draft;
 }
 
-function sendFixtureResponse(ticket: TicketRequest, response: express.Response): void {
-  const fixtureResult = triageResponseSchema.safeParse(createFixtureTriage(ticket));
-  if (!fixtureResult.success) {
-    response.status(500).json({
-      error: { code: "INTERNAL_ERROR", message: "Unable to create a triage response." },
-    });
-    return;
-  }
-  response.status(200).json(fixtureResult.data);
-}
-
 export function createApp(options: AppOptions = {}) {
   const app = express();
+  const idempotencyCache = new Map<string, IdempotencyEntry>();
   const getMode = options.mode ?? (() => process.env.TRIAGE_MODE);
   const getApiKey = options.apiKey ?? (() => process.env.GEMINI_API_KEY);
   const geminiProvider = options.geminiProvider ?? ((ticket: TicketRequest) => {
@@ -46,6 +69,46 @@ export function createApp(options: AppOptions = {}) {
     if (!apiKey) throw new Error("Gemini API key is not configured.");
     return createGeminiSuggestion(ticket, apiKey);
   });
+
+  async function createTriageResponse(ticket: TicketRequest): Promise<TriageResponse | null> {
+    try {
+      const apiKey = getApiKey();
+      const useGemini = getMode() === "gemini" && (Boolean(apiKey) || Boolean(options.geminiProvider));
+      if (!useGemini) return createValidatedFixtureResponse(ticket);
+
+      const suggestion = triageSuggestionSchema.safeParse(await geminiProvider(ticket));
+      if (!suggestion.success) return createValidatedFixtureResponse(ticket);
+
+      // Reuse backend-only policy rules; the provider never supplies refund or escalation fields.
+      const policy = createFixtureTriage(ticket);
+      const responseResult = triageResponseSchema.safeParse({
+        ticket_id: ticket.id,
+        ...suggestion.data,
+        reply_draft: protectUnapprovedRefundDraft(suggestion.data.reply_draft, policy.refund.status),
+        refund: policy.refund,
+        needs_human:
+          policy.refund.status === "pending_review" ||
+          policy.category === "fraud" ||
+          policy.severity === "high" ||
+          suggestion.data.category === "fraud" ||
+          suggestion.data.severity === "critical" ||
+          suggestion.data.confidence < 0.7,
+      });
+      return responseResult.success ? responseResult.data : createValidatedFixtureResponse(ticket);
+    } catch {
+      return createValidatedFixtureResponse(ticket);
+    }
+  }
+
+  function touchEntry(ticketId: string, entry: IdempotencyEntry): void {
+    if (idempotencyCache.get(ticketId) !== entry) return;
+    idempotencyCache.delete(ticketId);
+    idempotencyCache.set(ticketId, entry);
+  }
+
+  function removeEntryIfCurrent(ticketId: string, entry: IdempotencyEntry): void {
+    if (idempotencyCache.get(ticketId) === entry) idempotencyCache.delete(ticketId);
+  }
 
   app.use(express.json({ limit: "100kb" }));
 
@@ -66,55 +129,63 @@ export function createApp(options: AppOptions = {}) {
     }
 
     const ticket = requestResult.data;
-    const apiKey = getApiKey();
-    const useGemini = getMode() === "gemini" && (Boolean(apiKey) || Boolean(options.geminiProvider));
+    const fingerprint = fingerprintTicket(ticket);
+    let entry = idempotencyCache.get(ticket.id);
+
+    if (entry && entry.fingerprint !== fingerprint) {
+      response.status(409).json({
+        error: { code: "IDEMPOTENCY_CONFLICT", message: "Ticket ID was already used with a different request." },
+      });
+      return;
+    }
+
+    if (entry) {
+      touchEntry(ticket.id, entry);
+    } else {
+      if (idempotencyCache.size >= maxIdempotencyEntries) {
+        const oldestCompleted = [...idempotencyCache.entries()].find(([, cached]) => cached.completed);
+        if (oldestCompleted) idempotencyCache.delete(oldestCompleted[0]);
+        else {
+          response.status(503).json({
+            error: { code: "IDEMPOTENCY_CAPACITY", message: "Triage capacity is temporarily unavailable." },
+          });
+          return;
+        }
+      }
+
+      // Defer work one microtask so the in-flight reservation is in the map first.
+      const responsePromise = Promise.resolve().then(() => createTriageResponse(ticket));
+      entry = { fingerprint, response: responsePromise, completed: false };
+      idempotencyCache.set(ticket.id, entry);
+      const reservedEntry = entry;
+      void responsePromise.then(
+        (result) => {
+          if (!result) {
+            removeEntryIfCurrent(ticket.id, reservedEntry);
+            return;
+          }
+          reservedEntry.completed = true;
+          touchEntry(ticket.id, reservedEntry);
+        },
+        () => removeEntryIfCurrent(ticket.id, reservedEntry),
+      );
+    }
 
     try {
-      if (useGemini) {
-        const suggestion = triageSuggestionSchema.safeParse(await geminiProvider(ticket));
-        if (!suggestion.success) {
-          sendFixtureResponse(ticket, response);
-          return;
-        }
-
-        // Reuse backend-only policy rules; the provider never supplies refund or escalation fields.
-        const policy = createFixtureTriage(ticket);
-        const responseResult = triageResponseSchema.safeParse({
-          ticket_id: ticket.id,
-          ...suggestion.data,
-          reply_draft: protectUnapprovedRefundDraft(suggestion.data.reply_draft, policy.refund.status),
-          refund: policy.refund,
-          needs_human:
-            policy.refund.status === "pending_review" ||
-            policy.category === "fraud" ||
-            policy.severity === "high" ||
-            suggestion.data.category === "fraud" ||
-            suggestion.data.severity === "critical" ||
-            suggestion.data.confidence < 0.7,
-        });
-        if (!responseResult.success) {
-          sendFixtureResponse(ticket, response);
-          return;
-        }
-        response.status(200).json(responseResult.data);
-        return;
-      }
-
-      const responseResult = triageResponseSchema.safeParse(createFixtureTriage(ticket));
-      if (!responseResult.success) {
+      const result = await entry.response;
+      if (!result) {
+        removeEntryIfCurrent(ticket.id, entry);
         response.status(500).json({
           error: { code: "INTERNAL_ERROR", message: "Unable to create a triage response." },
         });
         return;
       }
-      response.status(200).json(responseResult.data);
+      response.status(200).json(result);
     } catch {
-      if (useGemini) sendFixtureResponse(ticket, response);
-      else {
-        response.status(500).json({
-          error: { code: "INTERNAL_ERROR", message: "Unable to create a triage response." },
-        });
-      }
+      removeEntryIfCurrent(ticket.id, entry);
+      response.status(500).json({
+        error: { code: "INTERNAL_ERROR", message: "Unable to create a triage response." },
+      });
     }
   });
 

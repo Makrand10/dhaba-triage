@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
-import app from "../src/app.js";
+import { createApp } from "../src/app.js";
 import { triageResponseSchema } from "../src/schemas/triage-schema.js";
 
 const validTicket = {
@@ -24,12 +24,9 @@ const validTicket = {
 describe("triage API", () => {
   let server: Server;
   let baseUrl: string;
-  let previousMode: string | undefined;
 
   beforeEach(async () => {
-    previousMode = process.env.TRIAGE_MODE;
-    process.env.TRIAGE_MODE = "fixture";
-    server = app.listen(0);
+    server = createApp({ mode: () => "fixture" }).listen(0);
     await new Promise<void>((resolve) => server.once("listening", resolve));
     const address = server.address() as AddressInfo;
     baseUrl = `http://127.0.0.1:${address.port}`;
@@ -37,8 +34,6 @@ describe("triage API", () => {
 
   afterEach(async () => {
     await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
-    if (previousMode === undefined) delete process.env.TRIAGE_MODE;
-    else process.env.TRIAGE_MODE = previousMode;
   });
 
   it("returns a minimal health response", async () => {

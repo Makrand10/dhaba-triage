@@ -35,16 +35,19 @@ describe("Gemini-mode API with a mocked provider", () => {
   let providerCalls: TicketRequest[];
   let mockOutput: unknown;
   let providerFailure: Error | null;
+  let providerWait: Promise<void> | null;
 
   beforeEach(async () => {
     providerCalls = [];
     mockOutput = validSuggestion;
     providerFailure = null;
+    providerWait = null;
     const app = createApp({
       mode: () => "gemini",
       // The injected mock deliberately works without an API key.
       geminiProvider: async (ticket) => {
         providerCalls.push(ticket);
+        if (providerWait) await providerWait;
         if (providerFailure) throw providerFailure;
         return mockOutput;
       },
@@ -83,6 +86,76 @@ describe("Gemini-mode API with a mocked provider", () => {
       if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
       else process.env.GEMINI_API_KEY = previousKey;
     }
+  });
+
+  it("reuses the cached result for a sequential duplicate ticket", async () => {
+    const sendTicket = () =>
+      fetch(`${baseUrl}/triage`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(validTicket),
+      });
+
+    const firstResponse = await sendTicket();
+    const firstPayload: unknown = await firstResponse.json();
+    const secondResponse = await sendTicket();
+    const secondPayload: unknown = await secondResponse.json();
+
+    expect(firstResponse.status).toBe(200);
+    expect(secondResponse.status).toBe(200);
+    expect(secondPayload).toEqual(firstPayload);
+    expect(triageResponseSchema.safeParse(secondPayload).success).toBe(true);
+    expect(providerCalls).toEqual([validTicket]);
+  });
+
+  it("shares one in-flight provider call for concurrent duplicate tickets", async () => {
+    let releaseProvider!: () => void;
+    providerWait = new Promise<void>((resolve) => {
+      releaseProvider = resolve;
+    });
+    const sendTicket = () =>
+      fetch(`${baseUrl}/triage`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(validTicket),
+      });
+
+    const firstPromise = sendTicket();
+    const secondPromise = sendTicket();
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(providerCalls).toEqual([validTicket]);
+    } finally {
+      releaseProvider();
+    }
+
+    const [firstResponse, secondResponse] = await Promise.all([firstPromise, secondPromise]);
+    const firstPayload: unknown = await firstResponse.json();
+    const secondPayload: unknown = await secondResponse.json();
+    expect(firstResponse.status).toBe(200);
+    expect(secondResponse.status).toBe(200);
+    expect(secondPayload).toEqual(firstPayload);
+    expect(triageResponseSchema.safeParse(firstPayload).success).toBe(true);
+    expect(providerCalls).toEqual([validTicket]);
+  });
+
+  it("rejects a changed payload for an already-used ticket ID without processing it", async () => {
+    const sendTicket = (ticket: TicketRequest) =>
+      fetch(`${baseUrl}/triage`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(ticket),
+      });
+
+    const firstResponse = await sendTicket(validTicket);
+    expect(firstResponse.status).toBe(200);
+    const conflictResponse = await sendTicket({ ...validTicket, body: "A different request for the same ID." });
+
+    expect(conflictResponse.status).toBe(409);
+    expect(await conflictResponse.json()).toEqual({
+      error: { code: "IDEMPOTENCY_CONFLICT", message: "Ticket ID was already used with a different request." },
+    });
+    expect(providerCalls).toEqual([validTicket]);
   });
 
   it("keeps refund policy in the backend when Gemini suggests only triage fields", async () => {
@@ -219,20 +292,27 @@ describe("Gemini-mode API with a mocked provider", () => {
 
   it.each(["provider failure", "timeout"])("falls back to the validated fixture on %s", async (failure) => {
     providerFailure = new Error(`mock ${failure}`);
-    const response = await fetch(`${baseUrl}/triage`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(validTicket),
-    });
+    const sendTicket = () =>
+      fetch(`${baseUrl}/triage`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(validTicket),
+      });
+    const response = await sendTicket();
     const payload: unknown = await response.json();
+    const duplicateResponse = await sendTicket();
+    const duplicatePayload: unknown = await duplicateResponse.json();
     expect(response.status).toBe(200);
+    expect(duplicateResponse.status).toBe(200);
     expect(payload).toEqual(createFixtureTriage(validTicket));
+    expect(duplicatePayload).toEqual(payload);
     expect(triageResponseSchema.safeParse(payload).success).toBe(true);
     expect(payload).toMatchObject({
       confidence: 0.5,
       needs_human: true,
       refund: { status: "not_applicable", amount_inr: 0 },
     });
+    expect(providerCalls).toEqual([validTicket]);
   });
 
   it("forces human review when Gemini confidence is below 0.70", async () => {
