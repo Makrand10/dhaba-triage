@@ -4,3 +4,6 @@ node_modules/
 !.env.example
 dist/
 coverage/
+
+# Confidential take-home assignment data
+private-data/
