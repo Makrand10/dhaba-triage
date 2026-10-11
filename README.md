@@ -1,0 +1,5 @@
+# Dhaba Triage API
+
+This project currently runs in deterministic fixture mode. `POST /triage` applies a small, local keyword heuristic to a single ticket, returns a fixed-confidence demo draft, and makes no model calls or refund eligibility decisions. Customer text is treated only as untrusted input for keyword matching; embedded instructions cannot approve a refund or bypass review. The same valid ticket always produces the same output. Refund requests and synonyms, disputed or unauthorized charges, renewal disputes, explicit ambiguous billing phrases (including supported Hinglish payment activation phrases), and initiated or failed purchases are sent to `pending_review` with a zero amount and `needs_human: true`; suspected fraud also always requires human review. Other tickets receive `not_applicable` with a zero amount. These rules are illustrative demo behavior, not an AI classification or refund policy.
+
+Run with `npm run build` followed by `npm start`. The service listens on port 3000 by default; set `PORT` to change it. No API key is needed. `GET /health` returns `{ "status": "ok" }`.
