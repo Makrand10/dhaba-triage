@@ -19,8 +19,8 @@ const baseTicket: TicketRequest = {
   app_opens_since_renewal: 1,
 };
 
-function classify(subject: string, body = "Please take a look.") {
-  return createFixtureTriage({ ...baseTicket, subject, body });
+function classify(subject: string, body = "Please take a look.", overrides: Partial<TicketRequest> = {}) {
+  return createFixtureTriage({ ...baseTicket, ...overrides, subject, body });
 }
 
 describe("deterministic triage fixture rules", () => {
@@ -82,5 +82,16 @@ describe("deterministic triage fixture rules", () => {
     );
     expect(result.refund.status).toBe("pending_review");
     expect(result.refund.amount_inr).toBe(0);
+  });
+  it("does not flag an explicitly denied refund request", () => {
+    const result = classify(
+      "Question about subscription features",
+      "I am not requesting a refund. I only want to know which features are included.",
+      { purchases: [] },
+    );
+
+    expect(result.refund.status).toBe("not_applicable");
+    expect(result.refund.amount_inr).toBe(0);
+    expect(result.needs_human).toBe(true);
   });
 });

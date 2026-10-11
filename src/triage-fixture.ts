@@ -4,9 +4,14 @@ import type { TicketRequest, TriageResponse } from "./schemas/triage-schema.js";
 export function createFixtureTriage(ticket: TicketRequest): TriageResponse {
   const text = `${ticket.subject} ${ticket.body}`.toLowerCase();
   const category = classifyCategory(text);
+  const explicitlyNotRequestingRefund =
+    /\b(?:not|never|don't|do not|didn't|did not)\s+(?:requesting|request|want|need|asking for)?\s*(?:a\s+)?(?:refund|money back|reimbursement)\b/.test(text) ||
+    /\bnot\s+(?:requesting|asking for|seeking)\s+(?:a\s+)?refund\b/.test(text);
+
   const refundRequested =
-    /\b(refund|money back|reimburse|chargeback)\b/.test(text) ||
-    /\breverse (?:this )?(?:charge|transaction)\b/.test(text);
+    !explicitlyNotRequestingRefund &&
+    (/\b(refund|money back|reimburse|chargeback)\b/.test(text) ||
+      /\breverse (?:this )?(?:charge|transaction)\b/.test(text));
   const disputedOrUnauthorizedCharge =
     /\b(disputed|unauthorized|unrecognized|unrecognised)[\s-]+(?:credit card )?charges?\b/.test(text) ||
     /\bcharges?\s+(?:were )?(?:disputed|unauthorized|unrecognized|unrecognised)\b/.test(text) ||
